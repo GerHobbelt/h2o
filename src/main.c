@@ -899,6 +899,9 @@ static const char *listener_setup_ssl_picotls(struct listener_config_t *listener
             pctx->ctx.cipher_suites = replace_ciphersuites(pctx->ctx.cipher_suites, fusion_all);
         }
 #endif
+        // disable async handshaking in quic until it is supported in quicly
+        pctx->sc.async = 0;
+
         quicly_amend_ptls_context(&pctx->ctx);
     }
 
@@ -1304,6 +1307,10 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
         /* initialize OpenSSL context */
         identity->ossl = SSL_CTX_new(SSLv23_server_method());
         SSL_CTX_set_options(identity->ossl, ssl_options);
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
+        SSL_CTX_set_mode(identity->ossl, SSL_MODE_ASYNC);
+#endif
+
         SSL_CTX_set_session_id_context(identity->ossl, H2O_SESSID_CTX, H2O_SESSID_CTX_LEN);
         setup_ecc_key(identity->ossl);
         if (cipher_suite != NULL && SSL_CTX_set_cipher_list(identity->ossl, (*cipher_suite)->data.scalar) != 1) {

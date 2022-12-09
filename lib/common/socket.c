@@ -88,10 +88,6 @@ struct st_h2o_socket_ssl_t {
     size_t record_overhead;
     uint64_t ossl_last_record_iv; /* UINT64_MAX if not used */
     struct {
-        void (*cb)(void *data);
-        void *data;
-    } on_close;
-    struct {
         h2o_socket_cb cb;
         union {
             struct {
@@ -160,6 +156,8 @@ static void dispose_ssl_output_buffer(struct st_h2o_socket_ssl_t *ssl);
 static int has_pending_ssl_bytes(struct st_h2o_socket_ssl_t *ssl);
 static size_t generate_tls_records(h2o_socket_t *sock, h2o_iovec_t **bufs, size_t *bufcnt, size_t first_buf_written);
 static void do_dispose_socket(h2o_socket_t *sock);
+static void do_close_socket(h2o_socket_t *sock);
+static int socket_is_closed(h2o_socket_t *_sock);
 static void report_early_write_error(h2o_socket_t *sock);
 static void do_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt);
 static void do_read_start(h2o_socket_t *sock);
@@ -177,6 +175,26 @@ static void *zerocopy_buffers_release(struct st_h2o_socket_zerocopy_buffers_t *b
 static const char *decode_ssl_input(h2o_socket_t *sock);
 static size_t flatten_sendvec(h2o_socket_t *sock, h2o_sendvec_t *sendvec);
 static void on_write_complete(h2o_socket_t *sock, const char *err);
+
+static __thread h2o_socket_t *async_handshake_in_flight = NULL;
+
+int h2o_is_ssl_handhsake_in_flight() {
+    return async_handshake_in_flight != NULL;
+}
+
+/**
+ * list of h2o_socket_t*
+ */
+static __thread h2o_linklist_t delayed_sockets;
+
+static int init_delayed_sockets() {
+    static __thread int initialized = 0;
+    if (!initialized) {
+        h2o_linklist_init_anchor(&delayed_sockets);
+        initialized = 1;
+    }
+    return initialized;
+}
 
 h2o_buffer_mmap_settings_t h2o_socket_buffer_mmap_settings = {
     32 * 1024 * 1024, /* 32MB, should better be greater than max frame size of HTTP2 for performance reasons */
@@ -480,6 +498,11 @@ static void destroy_ssl(struct st_h2o_socket_ssl_t *ssl)
         ssl->ptls = NULL;
     }
     if (ssl->ossl != NULL) {
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
+        while (SSL_waiting_for_async(ssl->ossl)) {
+            SSL_do_handshake(ssl->ossl);
+        }
+#endif
         if (!SSL_is_server(ssl->ossl)) {
             free(ssl->handshake.client.server_name);
             free(ssl->handshake.client.session_cache_key.base);
@@ -493,10 +516,61 @@ static void destroy_ssl(struct st_h2o_socket_ssl_t *ssl)
     free(ssl);
 }
 
+static void proceed_handshake(h2o_socket_t *sock, const char *err);
+
+static void do_delayed_sockets(h2o_socket_t *sock)
+{
+    if (async_handshake_in_flight == sock) {
+        async_handshake_in_flight = NULL;
+
+        // proceed delayed handshakes
+        while (init_delayed_sockets()
+                && async_handshake_in_flight == NULL
+                && !h2o_linklist_is_empty(&delayed_sockets)) {
+            h2o_socket_t *next_sock = H2O_STRUCT_FROM_MEMBER(h2o_socket_t, async.delayed_link, delayed_sockets.next);
+            h2o_linklist_unlink(&next_sock->async.delayed_link);
+            h2o_socket_cb delayed_cb = next_sock->async.delayed_cb;
+            next_sock->async.delayed_cb = NULL;
+            delayed_cb(next_sock, NULL);
+        }
+    }
+}
+
+static void dispose_socket(h2o_socket_t *sock, const char *err);
+
+static void retry_dispose_socket(h2o_socket_t *sock, const char *err)
+{
+    if (err == NULL) {
+        dispose_socket(sock, err);
+    }
+}
+
 static void dispose_socket(h2o_socket_t *sock, const char *err)
 {
     void (*close_cb)(void *data);
     void *close_cb_data;
+
+    if (h2o_linklist_is_linked(&sock->async.delayed_link)) {
+        sock->async.delayed_cb(sock, h2o_socket_error_closed);
+        sock->async.delayed_cb = NULL;
+        h2o_linklist_unlink(&sock->async.delayed_link);
+    }
+
+    if (!socket_is_closed(sock)) {
+        do_close_socket(sock);
+    }
+
+    if (init_delayed_sockets()) {
+        if (sock->ssl != NULL && async_handshake_in_flight != NULL && async_handshake_in_flight != sock) {
+            // retry later if handshake in flight
+            // we do this because ssl destroy may require neverbleed connection
+            if (!h2o_linklist_is_linked(&sock->async.delayed_link)) {
+                sock->async.delayed_cb = retry_dispose_socket;
+                h2o_linklist_insert(&delayed_sockets, &sock->async.delayed_link);
+            }
+            return;
+        }
+    }
 
     if (sock->ssl != NULL) {
         destroy_ssl(sock->ssl);
@@ -1464,6 +1538,11 @@ Exit:
 
 static void on_handshake_complete(h2o_socket_t *sock, const char *err)
 {
+    if (h2o_linklist_is_linked(&sock->async.delayed_link)) {
+        sock->async.delayed_cb = NULL;
+        h2o_linklist_unlink(&sock->async.delayed_link);
+    }
+
     if (err == NULL) {
         /* Post-handshake setup: set record_overhead, zerocopy, switch to picotls */
         if (sock->ssl->ptls == NULL) {
@@ -1540,8 +1619,7 @@ static void on_handshake_fail_complete(h2o_socket_t *sock, const char *err)
     on_handshake_complete(sock, get_handshake_error(sock->ssl));
 }
 
-static void proceed_handshake(h2o_socket_t *sock, const char *err);
-
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
 struct async_data {
     h2o_socket_t *async_sock;
     struct {
@@ -1562,27 +1640,13 @@ static void async_read_ready(h2o_socket_t *listener, const char *err)
     // reset async
     assert(adata->client.sock->async.enabled);
     adata->client.sock->async.enabled = 0;
-    do_dispose_socket(listener);
+    dispose_socket(listener, NULL);
 
     if (err != NULL) {
         return;
     }
     proceed_handshake(adata->client.sock, NULL);
-}
-
-static void async_ssl_on_close(void *data)
-{
-    struct async_data *adata = data;
-
-    // closing ssl, resume async transaction if pending to allow
-    // resources to be freed
-    if (SSL_waiting_for_async(adata->client.sock->ssl->ossl)) {
-        assert(adata->client.sock->async.enabled);
-        SSL_do_handshake(adata->client.sock->ssl->ossl);
-    }
-
-    // call original cb
-    adata->client.ssl.on_close_cb(adata->client.ssl.on_close_data);
+    do_delayed_sockets(adata->client.sock);
 }
 
 static void async_on_close(void *data)
@@ -1591,8 +1655,10 @@ static void async_on_close(void *data)
 
     // cancel async callback
     if (adata->client.sock->async.enabled) {
-        do_dispose_socket(adata->async_sock);
+        dispose_socket(adata->async_sock, NULL);
     }
+
+    do_delayed_sockets(adata->client.sock);
 
     // call original cb
     adata->client.on_close_cb(adata->client.on_close_data);
@@ -1602,11 +1668,26 @@ static void async_on_close(void *data)
 
 static void do_ssl_async(h2o_socket_t *sock)
 {
-    // async_handshake_in_flight = sock;
+    int async_fd;
+
+    async_handshake_in_flight = sock;
     assert(!sock->async.enabled);
     sock->async.enabled = 1;
-
-    int async_fd = ptls_openssl_get_async_fd(sock->ssl->ptls);
+    if (sock->ssl->ptls != NULL) {
+        async_fd = ptls_openssl_get_async_fd(sock->ssl->ptls);
+    } else {
+        size_t numfds;
+        int fds[1];
+        assert(sock->ssl->ossl != NULL);
+        // get async fd
+        SSL_get_all_async_fds(sock->ssl->ossl, NULL, &numfds);
+        assert(numfds == 1);
+        SSL_get_all_async_fds(sock->ssl->ossl, fds, &numfds);
+        async_fd = fds[0];
+    }
+    // dup the fd as h2o socket handling will close it
+    async_fd = dup(async_fd);
+    assert(async_fd != -1);
 
     // add async fd to event loop in order to retry when openssl engine is ready
 #if H2O_USE_LIBUV
@@ -1623,8 +1704,6 @@ static void do_ssl_async(h2o_socket_t *sock)
         // new socket, keep original callbacks
         adata->client.on_close_cb = sock->on_close.cb;
         adata->client.on_close_data = sock->on_close.data;
-        adata->client.ssl.on_close_cb = sock->ssl->on_close.cb;
-        adata->client.ssl.on_close_data = sock->ssl->on_close.data;
     } else {
         // sock callbacks were overwritten
         // get original callbacks from previous adata
@@ -1639,8 +1718,6 @@ static void do_ssl_async(h2o_socket_t *sock)
     // overrite socket close callbacks in order to cancel async and free socket
     sock->on_close.cb = async_on_close;
     sock->on_close.data = adata;
-    sock->ssl->on_close.cb = async_ssl_on_close;
-    sock->ssl->on_close.data = adata;
 
     // free previous data
     free(sock->async.data);
@@ -1648,6 +1725,7 @@ static void do_ssl_async(h2o_socket_t *sock)
 
     h2o_socket_read_start(async_sock, async_read_ready);
 }
+#endif
 
 static void proceed_handshake_picotls(h2o_socket_t *sock)
 {
@@ -1655,7 +1733,11 @@ static void proceed_handshake_picotls(h2o_socket_t *sock)
     ptls_buffer_t wbuf;
     ptls_buffer_init(&wbuf, "", 0);
 
-    int ret = ptls_handshake(sock->ssl->ptls, &wbuf, sock->ssl->input.encrypted->bytes, &consumed, NULL);
+    int ret;
+#ifndef PTLS_OPENSSL_HAVE_ASYNC
+Retry:
+#endif
+    ret = ptls_handshake(sock->ssl->ptls, &wbuf, sock->ssl->input.encrypted->bytes, &consumed, NULL);
     h2o_buffer_consume(&sock->ssl->input.encrypted, consumed);
 
     /* determine the next action */
@@ -1665,7 +1747,11 @@ static void proceed_handshake_picotls(h2o_socket_t *sock)
         next_cb = on_handshake_complete;
         break;
     case PTLS_ERROR_ASYNC_OPERATION:
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
         do_ssl_async(sock);
+#else
+        goto Retry;
+#endif
         /* fallthrough */
     case PTLS_ERROR_IN_PROGRESS:
         next_cb = proceed_handshake;
@@ -1724,6 +1810,11 @@ Redo:
         case ASYNC_RESUMPTION_STATE_REQUEST_SENT: {
             /* sent async request, reset the ssl state, and wait for async response */
             assert(ret < 0);
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
+            while (SSL_waiting_for_async(sock->ssl->ossl)) {
+                SSL_accept(sock->ssl->ossl);
+            }
+#endif
             SSL_free(sock->ssl->ossl);
             create_ossl(sock);
             if (has_pending_ssl_bytes(sock->ssl))
@@ -1744,6 +1835,13 @@ Redo:
     }
 
     if (ret == 0 || (ret < 0 && SSL_get_error(sock->ssl->ossl, ret) != SSL_ERROR_WANT_READ)) {
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
+        if (SSL_get_error(sock->ssl->ossl, ret) == SSL_ERROR_WANT_ASYNC) {
+            do_ssl_async(sock);
+            return;
+        }
+#endif
+
         /* OpenSSL 1.1.0 emits an alert immediately, we  send it now. 1.0.2 emits the error when SSL_shutdown is called in
          * shutdown_ssl. */
         if (has_pending_ssl_bytes(sock->ssl)) {
@@ -1820,7 +1918,12 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
     if (ptls == NULL)
         h2o_fatal("no memory");
     *ptls_get_data_ptr(ptls) = sock;
-    int ret = ptls_handshake(ptls, &wbuf, sock->ssl->input.encrypted->bytes, &consumed, NULL);
+
+    int ret;
+#ifndef PTLS_OPENSSL_HAVE_ASYNC
+Retry:
+#endif
+    ret = ptls_handshake(ptls, &wbuf, sock->ssl->input.encrypted->bytes, &consumed, NULL);
 
     if (ret == PTLS_ERROR_IN_PROGRESS && wbuf.off == 0) {
         /* we aren't sure if the picotls can process the handshake, retain handshake transcript and replay on next occasion */
@@ -1844,7 +1947,11 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
             cb = on_handshake_complete;
             break;
         case PTLS_ERROR_ASYNC_OPERATION:
+#ifdef PTLS_OPENSSL_HAVE_ASYNC
             do_ssl_async(sock);
+#else
+            goto Retry;
+#endif
             /* fallthrough */
         case PTLS_ERROR_IN_PROGRESS:
             cb = proceed_handshake;
@@ -1861,6 +1968,12 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
     ptls_buffer_dispose(&wbuf);
 }
 
+static void retry_proceed_handshake(h2o_socket_t *sock, const char *err) {
+    if (err == NULL) {
+        proceed_handshake(sock, err);
+    }
+}
+
 static void proceed_handshake(h2o_socket_t *sock, const char *err)
 {
     sock->_cb.write = NULL;
@@ -1869,6 +1982,18 @@ static void proceed_handshake(h2o_socket_t *sock, const char *err)
         h2o_socket_read_stop(sock);
         on_handshake_complete(sock, err);
         return;
+    }
+
+    if (init_delayed_sockets()) {
+        if (async_handshake_in_flight != NULL && async_handshake_in_flight != sock) {
+            // handshake is in-flight, delay the handshake
+            if (!h2o_linklist_is_linked(&sock->async.delayed_link)) {
+                sock->async.delayed_cb = retry_proceed_handshake;
+                // fprintf(stderr, "retry handshake\n");
+                h2o_linklist_insert(&delayed_sockets, &sock->async.delayed_link);
+            }
+            return;
+        }
     }
 
     if (sock->ssl->ptls != NULL) {
