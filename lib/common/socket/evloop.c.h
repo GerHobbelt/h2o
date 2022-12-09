@@ -645,8 +645,10 @@ static void set_nodelay_if_likely_tcp(int fd, struct sockaddr *sa)
 
 h2o_socket_t *h2o_evloop_socket_create(h2o_evloop_t *loop, int fd, int flags)
 {
-    /* It is the reponsibility of the event loop to modify the properties of a socket for its use (e.g., set O_NONBLOCK). */
-    fcntl(fd, F_SETFL, O_NONBLOCK);
+    if ((flags & H2O_SOCKET_FLAG_DONT_NONBLOCK) == 0) {
+        /* It is the reponsibility of the event loop to modify the properties of a socket for its use (e.g., set O_NONBLOCK). */
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+    }
     set_nodelay_if_likely_tcp(fd, NULL);
 
     return &create_socket(loop, fd, flags)->super;
