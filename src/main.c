@@ -171,6 +171,7 @@ struct listener_ssl_config_t {
      */
     struct listener_ssl_identity_t *identities;
     h2o_iovec_t *http2_origin_frame;
+    unsigned use_zerocopy : 1;
     /**
      * per-SNI CC (nullable)
      */
@@ -438,17 +439,22 @@ static int on_sni_callback(SSL *ssl, int *ad, void *arg)
 {
     struct listener_config_t *listener = arg;
     const char *server_name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    h2o_socket_t *sock = SSL_get_app_data(ssl);
+    int use_zerocopy = listener->ssl.entries[0]->use_zerocopy;
 
     if (server_name != NULL) {
         size_t server_name_len = strlen(server_name);
-        h2o_socket_t *sock = SSL_get_app_data(ssl);
         on_sni_update_tracing(sock, 0, server_name, server_name_len);
         struct listener_ssl_config_t *resolved = resolve_sni(listener, server_name, server_name_len);
         if (resolved->identities[0].ossl != SSL_get_SSL_CTX(ssl)) {
             SSL_set_SSL_CTX(ssl, resolved->identities[0].ossl);
             set_tcp_congestion_controller(sock, resolved->cc.tcp);
+            use_zerocopy = resolved->use_zerocopy;
         }
     }
+
+    if (use_zerocopy)
+        h2o_socket_use_zero_copy(sock);
 
     return SSL_TLSEXT_ERR_OK;
 }
@@ -460,6 +466,12 @@ struct st_on_client_hello_ptls_t {
 
 static int on_client_hello_ptls(ptls_on_client_hello_t *_self, ptls_t *tls, ptls_on_client_hello_parameters_t *params)
 {
+    /* `on_client_hello_ptls` can be called even when OpenSSL is going to be used, due to client supporting only TLS/1.2 (see
+     * https://github.com/h2o/picotls/pull/311). If that is the case, there is nothing to do here, as everything will be done in
+     * `on_sni_callback`. */
+    if (params->incompatible_version)
+        return 0;
+
     struct st_on_client_hello_ptls_t *self = (struct st_on_client_hello_ptls_t *)_self;
     void *conn = *ptls_get_data_ptr(tls);
     struct listener_ssl_config_t *ssl_config;
@@ -479,6 +491,8 @@ static int on_client_hello_ptls(ptls_on_client_hello_t *_self, ptls_t *tls, ptls
     /* apply config at ssl_config-level */
     if (self->listener->quic.ctx == NULL) {
         set_tcp_congestion_controller(conn, ssl_config->cc.tcp);
+        if (ssl_config->use_zerocopy)
+            h2o_socket_use_zero_copy(conn);
     } else {
         if (ssl_config->cc.quic != NULL)
             quicly_set_cc(conn, ssl_config->cc.quic);
@@ -731,9 +745,44 @@ Exit:
     return ret;
 }
 
+#if H2O_USE_FUSION
+
+static ptls_cipher_suite_t **replace_ciphersuites(ptls_cipher_suite_t **input, ptls_cipher_suite_t **replacements)
+{
+    H2O_VECTOR(ptls_cipher_suite_t *) new_list = {NULL};
+
+    for (; *input != NULL; ++input) {
+        ptls_cipher_suite_t *cs = *input;
+        for (ptls_cipher_suite_t **cand = replacements; *cand != NULL; ++cand) {
+            if (cs->id == (*cand)->id) {
+                cs = *cand;
+                break;
+            }
+        }
+        h2o_vector_reserve(NULL, &new_list, new_list.size + 1);
+        new_list.entries[new_list.size++] = cs;
+    }
+
+    h2o_vector_reserve(NULL, &new_list, new_list.size + 1);
+    new_list.entries[new_list.size++] = NULL;
+
+    return new_list.entries;
+}
+
+static int setup_chimera_crypto(ptls_aead_context_t *ctx, int is_enc, const void *key, const void *iv)
+{
+    if (is_enc) {
+        return ptls_fastls_aes128gcm.setup_crypto(ctx, 1, key, iv);
+    } else {
+        return ptls_openssl_aes128gcm.setup_crypto(ctx, 0, key, iv);
+    }
+}
+
+#endif
+
 static const char *listener_setup_ssl_picotls(struct listener_config_t *listener, struct listener_ssl_identity_t *identity,
                                               ptls_iovec_t raw_public_key, ptls_cipher_suite_t **cipher_suites,
-                                              int server_cipher_preference)
+                                              int server_cipher_preference, int use_zerocopy)
 {
     static const ptls_key_exchange_algorithm_t *key_exchanges[] = {
 #ifdef PTLS_OPENSSL_HAVE_X25519
@@ -852,32 +901,30 @@ static const char *listener_setup_ssl_picotls(struct listener_config_t *listener
 #if H2O_USE_FUSION
         /* rebuild and replace the cipher suite list, replacing the corresponding ones to fusion */
         if (ptls_fusion_is_supported_by_cpu()) {
-            static const ptls_cipher_suite_t fusion_aes128gcmsha256 = {PTLS_CIPHER_SUITE_AES_128_GCM_SHA256, &ptls_fusion_aes128gcm,
-                                                                       &ptls_openssl_sha256},
-                                             fusion_aes256gcmsha384 = {PTLS_CIPHER_SUITE_AES_256_GCM_SHA384, &ptls_fusion_aes256gcm,
-                                                                       &ptls_openssl_sha384};
-            H2O_VECTOR(ptls_cipher_suite_t *) new_list = {};
-#define PUSH_NEW(x)                                                                                                                \
-    do {                                                                                                                           \
-        h2o_vector_reserve(NULL, &new_list, new_list.size + 1);                                                                    \
-        new_list.entries[new_list.size++] = (x);                                                                                   \
-    } while (0)
-            for (ptls_cipher_suite_t **input = pctx->ctx.cipher_suites; *input != NULL; ++input) {
-                h2o_vector_reserve(NULL, &new_list, new_list.size + 1);
-                if (*input == &ptls_openssl_aes128gcmsha256) {
-                    PUSH_NEW(&fusion_aes128gcmsha256);
-                } else if (*input == &ptls_openssl_aes256gcmsha384) {
-                    PUSH_NEW(&fusion_aes256gcmsha384);
-                } else {
-                    PUSH_NEW(*input);
-                }
-            }
-            PUSH_NEW(NULL);
-#undef PUSH_NEW
-            pctx->ctx.cipher_suites = new_list.entries;
+            static ptls_cipher_suite_t aes128gcmsha256 = {PTLS_CIPHER_SUITE_AES_128_GCM_SHA256, &ptls_fusion_aes128gcm,
+                                                          &ptls_openssl_sha256},
+                                       aes256gcmsha384 = {PTLS_CIPHER_SUITE_AES_256_GCM_SHA384, &ptls_fusion_aes256gcm,
+                                                          &ptls_openssl_sha384},
+                                       *fusion_all[] = {&aes128gcmsha256, &aes256gcmsha384, NULL};
+            pctx->ctx.cipher_suites = replace_ciphersuites(pctx->ctx.cipher_suites, fusion_all);
         }
 #endif
         quicly_amend_ptls_context(&pctx->ctx);
+    } else {
+#if H2O_USE_FUSION
+        if (ptls_fusion_is_supported_by_cpu()) {
+            static struct st_ptls_aead_algorithm_t aes128gcm;
+            H2O_MULTITHREAD_ONCE({
+                memcpy(&aes128gcm, &ptls_fastls_aes128gcm, sizeof(aes128gcm));
+                if (aes128gcm.context_size < ptls_openssl_aes128gcm.context_size)
+                    aes128gcm.context_size = ptls_openssl_aes128gcm.context_size;
+                aes128gcm.setup_crypto = setup_chimera_crypto;
+            });
+            static ptls_cipher_suite_t aes128gcmsha256 = {PTLS_CIPHER_SUITE_AES_128_GCM_SHA256, &aes128gcm, &ptls_openssl_sha256},
+                                       *fastls_all[] = {&aes128gcmsha256, NULL};
+            pctx->ctx.cipher_suites = replace_ciphersuites(pctx->ctx.cipher_suites, fastls_all);
+        }
+#endif
     }
 
     identity->ptls = &pctx->ctx;
@@ -1051,13 +1098,14 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
 {
     yoml_t **dh_file, **min_version, **max_version, **cipher_suite, **cipher_suite_tls13_node, **ocsp_update_cmd,
         **ocsp_update_interval_node, **ocsp_max_failures_node, **cipher_preference_node, **neverbleed_node,
-        **http2_origin_frame_node, **client_ca_file;
+        **http2_origin_frame_node, **client_ca_file, **zerocopy_node;
     struct listener_ssl_parsed_identity_t *parsed_identities;
     size_t num_parsed_identities;
 
     h2o_iovec_t *http2_origin_frame = NULL;
     long ssl_options = SSL_OP_ALL;
     int use_neverbleed = 1, use_picotls = 1; /* enabled by default */
+    ssize_t use_zerocopy = 0;
     ptls_cipher_suite_t **cipher_suite_tls13 = NULL;
 
     if (!listener_is_new) {
@@ -1080,11 +1128,11 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
                                            "identity:a,certificate-file:s,key-file:s,min-version:s,minimum-version:s,max-version:s,"
                                            "maximum-version:s,cipher-suite:s,cipher-suite-tls1.3:a,ocsp-update-cmd:s,"
                                            "ocsp-update-interval:*,ocsp-max-failures:*,dh-file:s,cipher-preference:*,neverbleed:*,"
-                                           "http2-origin-frame:*,client-ca-file:s",
+                                           "http2-origin-frame:*,client-ca-file:s,zerocopy:s",
                                            &identity_node, &certificate_file, &key_file, &min_version, &min_version, &max_version,
                                            &max_version, &cipher_suite, &cipher_suite_tls13_node, &ocsp_update_cmd,
                                            &ocsp_update_interval_node, &ocsp_max_failures_node, &dh_file, &cipher_preference_node,
-                                           &neverbleed_node, &http2_origin_frame_node, &client_ca_file) != 0)
+                                           &neverbleed_node, &http2_origin_frame_node, &client_ca_file, &zerocopy_node) != 0)
             return -1;
         if (identity_node != NULL) {
             if (certificate_file != NULL || key_file != NULL) {
@@ -1191,6 +1239,8 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
             use_picotls = 0;
         }
     }
+    if (zerocopy_node != NULL && (use_zerocopy = h2o_configurator_get_one_of(cmd, *zerocopy_node, "OFF,ON")) == -1)
+        goto Error;
 
     /* setup OCSP stapling context as `ocsp_stapling`, or set to NULL if disabled */
     struct listener_ssl_ocsp_stapling_t *ocsp_stapling = h2o_mem_alloc(sizeof(*ocsp_stapling));
@@ -1259,10 +1309,11 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
     memset(ssl_config, 0, sizeof(*ssl_config));
     h2o_vector_reserve(NULL, &listener->ssl, listener->ssl.size + 1);
     listener->ssl.entries[listener->ssl.size++] = ssl_config;
-    if (ctx->hostconf != NULL) {
+    if (ctx->hostconf != NULL)
         listener_setup_ssl_add_host(ssl_config, ctx->hostconf->authority.hostport);
-    }
     ssl_config->http2_origin_frame = http2_origin_frame;
+    if (use_zerocopy)
+        ssl_config->use_zerocopy = 1;
     ssl_config->identities = h2o_mem_alloc(sizeof(*ssl_config->identities) * (num_parsed_identities + 1));
 
     /* load identities */
@@ -1325,8 +1376,9 @@ static int listener_setup_ssl(h2o_configurator_command_t *cmd, h2o_configurator_
             goto Error;
 
         if (use_picotls) {
-            const char *errstr = listener_setup_ssl_picotls(listener, identity, raw_pubkey, cipher_suite_tls13,
-                                                            !!(ssl_options & SSL_OP_CIPHER_SERVER_PREFERENCE));
+            const char *errstr =
+                listener_setup_ssl_picotls(listener, identity, raw_pubkey, cipher_suite_tls13,
+                                           !!(ssl_options & SSL_OP_CIPHER_SERVER_PREFERENCE), ssl_config->use_zerocopy);
             if (errstr != NULL) {
                 /* It is a fatal error to setup TLS 1.3 context, when setting up alternative identities, or a QUIC context. */
                 if (identity != ssl_config->identities || listener->quic.ctx != NULL) {
