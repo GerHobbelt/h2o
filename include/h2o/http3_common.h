@@ -167,6 +167,10 @@ typedef struct st_h2o_quic_stats_t {
      * number of quic packets successfully used for a connection
      */
     uint64_t packet_processed;
+    /**
+     * maximum number of packets in quicly sentmap
+     */
+    size_t num_sentmap_packets_max;
 
     /**
      * aggregated quicly stats
@@ -236,7 +240,9 @@ typedef struct st_h2o_quic_stats_t {
     func(num_frames_received.handshake_done, "num-frames-received.handshake_done") \
     func(num_frames_received.datagram, "num-frames-received.datagram") \
     func(num_frames_received.ack_frequency, "num-frames-received.ack_frequency") \
-    func(num_ptos, "num-ptos")
+    func(num_ptos, "num-ptos") \
+    func(num_handshake_timeouts, "num-handshake-timeouts") \
+    func(num_initial_handshake_exceeded, "num-initial-handshake-exceeded")
 /* clang-format on */
 
 struct st_h2o_quic_ctx_t {
