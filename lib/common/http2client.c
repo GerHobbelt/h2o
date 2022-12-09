@@ -100,6 +100,8 @@ struct st_h2o_http2client_stream_t {
         size_t remaining_content_length;
         unsigned message_body_forbidden : 1;
     } input;
+
+    int *notify_destroyed;
 };
 
 static void do_emit_writereq(struct st_h2o_http2client_conn_t *conn);
@@ -240,6 +242,9 @@ static void close_stream(struct st_h2o_http2client_stream_t *stream)
     if (stream->output.buf != NULL)
         h2o_buffer_dispose(&stream->output.buf);
     h2o_buffer_dispose(&stream->input.body);
+
+    if (stream->notify_destroyed != NULL)
+        *stream->notify_destroyed = 1;
 
     free(stream);
 }
@@ -1092,8 +1097,14 @@ static void on_write_complete(h2o_socket_t *sock, const char *err)
 
         /* request the app to send more, unless the stream is already closed (note: invocation of `proceed_req` might invoke
          * `do_write_req` synchronously) */
-        if (stream->output.proceed_req != NULL)
+        int stream_destroyed = 0;
+        if (stream->output.proceed_req != NULL) {
+            stream->notify_destroyed = &stream_destroyed;
             stream->output.proceed_req(&stream->super, NULL);
+            if (stream_destroyed)
+                continue;
+            stream->notify_destroyed = NULL;
+        }
 
         if (stream->output.proceed_req == NULL && !h2o_linklist_is_linked(&stream->output.sending_link)) {
             stream->state.req = STREAM_STATE_CLOSED;
@@ -1104,19 +1115,22 @@ static void on_write_complete(h2o_socket_t *sock, const char *err)
     /* reset the other buffer */
     h2o_buffer_dispose(&conn->output.buf_in_flight);
 
-    /* as request write, unlink the deferred timeout that might have been set by `proceed_req` called above */
+    /* bail out if nothing can be written */
+    if (conn->output.buf->size == 0 && h2o_linklist_is_empty(&conn->output.sending_streams)) {
+        assert(!h2o_timer_is_linked(&conn->output.defer_timeout));
+        close_connection_if_necessary(conn);
+        return;
+    }
+
+    /* run next write now instead of relying on the deferred timeout */
     if (h2o_timer_is_linked(&conn->output.defer_timeout))
         h2o_timer_unlink(&conn->output.defer_timeout);
-
 #if !H2O_USE_LIBUV
     if (conn->state == H2O_HTTP2CLIENT_CONN_STATE_OPEN) {
-        if (conn->output.buf->size != 0 || !h2o_linklist_is_empty(&conn->output.sending_streams))
-            h2o_socket_notify_write(sock, on_notify_write);
+        h2o_socket_notify_write(sock, on_notify_write);
         return;
     }
 #endif
-
-    /* write more, if possible */
     do_emit_writereq(conn);
     close_connection_if_necessary(conn);
 }

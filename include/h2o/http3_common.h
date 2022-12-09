@@ -119,10 +119,21 @@ size_t h2o_http3_goaway_frame_capacity(quicly_stream_id_t stream_or_push_id);
 uint8_t *h2o_http3_encode_goaway_frame(uint8_t *buff, quicly_stream_id_t stream_or_push_id);
 int h2o_http3_decode_goaway_frame(h2o_http3_goaway_frame_t *frame, const uint8_t *payload, size_t len, const char **err_desc);
 
+/*
+ * Special dummy values for representing errors from http3 acceptor
+ */
+extern h2o_quic_conn_t h2o_quic_accept_conn_decryption_failed;
+extern h2o_http3_conn_t h2o_quic_accept_conn_closed;
+
 /**
  * special error value to be returned by h2o_quic_accept_cb, to indicate that packet decryption failed during quicly_accept
  */
-#define H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED ((h2o_quic_conn_t *)1)
+#define H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED (&h2o_quic_accept_conn_decryption_failed)
+/**
+ * special error value to be returned by h2o_http3_server_accept, indicating that a connection was accepted but already closed due
+ * to an error. In this case connection counter decrements are already done.
+ */
+#define H2O_QUIC_ACCEPT_CONN_CLOSED (&h2o_quic_accept_conn_closed)
 
 /**
  * Accepts a new QUIC connection
@@ -155,7 +166,7 @@ typedef int (*h2o_quic_preprocess_packet_cb)(h2o_quic_ctx_t *ctx, struct msghdr 
  * be used for generating expression that take all the members equally.
  */
 struct st_h2o_quic_aggregated_stats_t {
-    QUICLY_STATS_PREBUILT_FIELDS;
+    QUICLY_STATS_PREBUILT_COUNTERS;
 };
 
 typedef struct st_h2o_quic_stats_t {
@@ -168,9 +179,9 @@ typedef struct st_h2o_quic_stats_t {
      */
     uint64_t packet_processed;
     /**
-     * maximum number of packets in quicly sentmap
+     * largest number of packets observed in quicly sentmap
      */
-    size_t num_sentmap_packets_max;
+    size_t num_sentmap_packets_largest;
 
     /**
      * aggregated quicly stats
@@ -485,7 +496,7 @@ void h2o_http3_dispose_conn(h2o_http3_conn_t *conn);
  */
 int h2o_http3_setup(h2o_http3_conn_t *conn, quicly_conn_t *quic);
 /**
- * sends packets immediately by calling quicly_send, sendmsg (returns 1 if success, 0 if the connection was destroyed)
+ * sends packets immediately by calling quicly_send, sendmsg (returns true if success, false if the connection was destroyed)
  */
 int h2o_quic_send(h2o_quic_conn_t *conn);
 /**
@@ -510,6 +521,10 @@ void h2o_http3_send_qpack_stream_cancel(h2o_http3_conn_t *conn, quicly_stream_id
  */
 void h2o_http3_send_qpack_header_ack(h2o_http3_conn_t *conn, const void *bytes, size_t len);
 /**
+ * Enqueue GOAWAY frame crafted for graceful shutdown
+ */
+void h2o_http3_send_shutdown_goaway_frame(h2o_http3_conn_t *conn);
+/**
  * Enqueue GOAWAY frame for sending
  */
 void h2o_http3_send_goaway_frame(h2o_http3_conn_t *conn, uint64_t stream_or_push_id);
@@ -517,10 +532,6 @@ void h2o_http3_send_goaway_frame(h2o_http3_conn_t *conn, uint64_t stream_or_push
  *
  */
 static int h2o_http3_has_received_settings(h2o_http3_conn_t *conn);
-/**
- * Returns a boolean indicating if the use of H3_DATAGRAM frame has been negotiated
- */
-int h2o_http3_can_use_h3_datagram(h2o_http3_conn_t *conn);
 /**
  * sends out H3 datagrams
  */

@@ -259,6 +259,8 @@ static struct {
      * Can be set to INT_MAX so that only max_connections would be used.
      */
     int max_quic_connections;
+    int soft_connection_limit;
+    int soft_connection_limit_min_age;
     /**
      * array size == number of worker threads to instantiate, the values indicate which CPU to pin, -1 if not
      */
@@ -316,6 +318,8 @@ static struct {
     .error_log = NULL,
     .max_connections = 1024,
     .max_quic_connections = INT_MAX, /* (INT_MAX = i.e., allow up to max_connections) */
+    .soft_connection_limit = INT_MAX,
+    .soft_connection_limit_min_age = 30,
     .thread_map = {0},               /* initialized in main() */
     .quic = {0},                     /* 0 defaults to all, conn_callbacks (initialized in main() */
     .tfo_queues = 0,                 /* initialized in main() */
@@ -2009,12 +2013,14 @@ static int on_config_listen_element(h2o_configurator_command_t *cmd, h2o_configu
                 listener->quic.ctx = quic;
                 if (quic_node != NULL) {
                     yoml_t **retry_node, **sndbuf, **rcvbuf, **amp_limit, **qpack_encoder_table_capacity, **max_streams_bidi,
-                        **max_udp_payload_size;
+                        **max_udp_payload_size, **handshake_timeout_rtt_multiplier, **max_initial_handshake_packets;
                     if (h2o_configurator_parse_mapping(cmd, *quic_node, NULL,
                                                        "retry:s,sndbuf:s,rcvbuf:s,amp-limit:s,qpack-encoder-table-capacity:s,max-"
-                                                       "streams-bidi:s,max-udp-payload-size:s",
+                                                       "streams-bidi:s,max-udp-payload-size:s,handshake-timeout-rtt-multiplier:s,"
+                                                       "max-initial-handshake-packets:s",
                                                        &retry_node, &sndbuf, &rcvbuf, &amp_limit, &qpack_encoder_table_capacity,
-                                                       &max_streams_bidi, &max_udp_payload_size) != 0)
+                                                       &max_streams_bidi, &max_udp_payload_size, &handshake_timeout_rtt_multiplier,
+                                                       &max_initial_handshake_packets) != 0)
                         return -1;
                     if (retry_node != NULL) {
                         ssize_t on = h2o_configurator_get_one_of(cmd, *retry_node, "OFF,ON");
@@ -2045,6 +2051,31 @@ static int on_config_listen_element(h2o_configurator_command_t *cmd, h2o_configu
                         if (h2o_configurator_scanf(cmd, *max_udp_payload_size, "%" SCNu64,
                                                    &listener->quic.ctx->transport_params.max_udp_payload_size) != 0)
                             return -1;
+                    }
+                    if (handshake_timeout_rtt_multiplier != NULL) {
+                        uint32_t v;
+
+                        if (h2o_configurator_scanf(cmd, *handshake_timeout_rtt_multiplier, "%" SCNu32, &v) != 0)
+                            return -1;
+
+                        if (v == 0) {
+                            h2o_configurator_errprintf(
+                                cmd, *handshake_timeout_rtt_multiplier,
+                                "[WARNING] handshake timeout multiplier == 0 is not recommended except for testing.");
+                        }
+                        listener->quic.ctx->handshake_timeout_rtt_multiplier = v;
+                    }
+                    if (max_initial_handshake_packets != NULL) {
+                        uint64_t v;
+
+                        if (h2o_configurator_scanf(cmd, *max_initial_handshake_packets, "%" SCNu64, &v) != 0)
+                            return -1;
+                        if (v == 0) {
+                            h2o_configurator_errprintf(cmd, *max_initial_handshake_packets,
+                                                       "max Initial/Handshake packets must be greater than 0");
+                            return -1;
+                        }
+                        listener->quic.ctx->max_initial_handshake_packets = v;
                     }
                 }
                 if (conf.run_mode == RUN_MODE_WORKER)
@@ -2215,6 +2246,16 @@ static int on_config_max_connections(h2o_configurator_command_t *cmd, h2o_config
 static int on_config_max_quic_connections(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     return h2o_configurator_scanf(cmd, node, "%d", &conf.max_quic_connections);
+}
+
+static int on_config_soft_connection_limit(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%d", &conf.soft_connection_limit);
+}
+
+static int on_config_soft_connection_limit_min_age(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%d", &conf.soft_connection_limit_min_age);
 }
 
 static inline int on_config_num_threads_add_cpu(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
@@ -2932,6 +2973,14 @@ static void on_socketclose(void *data)
     num_connections(-1);
 }
 
+static void close_idle_connections(h2o_context_t *ctx)
+{
+    int excess_connections = num_connections(0) - conf.soft_connection_limit;
+    if (excess_connections > 0) {
+        h2o_context_close_idle_connections(ctx, excess_connections / conf.thread_map.size,
+                                           conf.soft_connection_limit_min_age * 1000);
+    }
+}
 static void on_accept(h2o_socket_t *listener, const char *err)
 {
     struct listener_ctx_t *ctx = listener->data;
@@ -2945,6 +2994,8 @@ static void on_accept(h2o_socket_t *listener, const char *err)
 
     do {
         h2o_socket_t *sock;
+        close_idle_connections(ctx->accept_ctx.ctx);
+
         if (num_connections(1) >= conf.max_connections) {
             /* The accepting socket is disactivated before entering the next in `run_loop`.
              * Note: it is possible that the server would accept at most `max_connections + num_threads` connections, since the
@@ -3017,6 +3068,9 @@ static int validate_token(h2o_http3_server_ctx_t *ctx, struct sockaddr *remote, 
 static h2o_quic_conn_t *on_http3_accept(h2o_quic_ctx_t *_ctx, quicly_address_t *destaddr, quicly_address_t *srcaddr,
                                         quicly_decoded_packet_t *packet)
 {
+    h2o_http3_server_ctx_t *ctx = (void *)_ctx;
+    close_idle_connections(ctx->accept_ctx->ctx);
+
     /* adjust number of connections, or drop the incoming packet when handling too many connections */
     if (num_connections(1) >= conf.max_connections) {
         num_connections(-1);
@@ -3028,7 +3082,6 @@ static h2o_quic_conn_t *on_http3_accept(h2o_quic_ctx_t *_ctx, quicly_address_t *
         return NULL;
     }
 
-    h2o_http3_server_ctx_t *ctx = (void *)_ctx;
     struct init_ebpf_key_info_t ebpf_key_info = {
         .local = &destaddr->sa,
         .remote = &srcaddr->sa,
@@ -3109,8 +3162,12 @@ static h2o_quic_conn_t *on_http3_accept(h2o_quic_ctx_t *_ctx, quicly_address_t *
     /* accept the connection */
     conn = h2o_http3_server_accept(ctx, destaddr, srcaddr, packet, token, (H2O_EBPF_FLAGS_SKIP_TRACING_BIT & flags) != 0,
                                    &conf.quic.conn_callbacks);
-    if (conn == NULL || &conn->super == H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED)
+    if (conn == NULL || &conn->super == H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED) {
         goto Exit;
+    } else if (conn == H2O_QUIC_ACCEPT_CONN_CLOSED) {
+        conn = NULL;
+        goto ExitNoDecrements;
+    }
     num_sessions(1);
 
 Exit:
@@ -3119,6 +3176,7 @@ Exit:
         num_connections(-1);
         num_quic_connections(-1);
     }
+ExitNoDecrements:
     return &conn->super;
 }
 
@@ -3218,12 +3276,6 @@ static void *run_loop(void *_thread_index)
             listeners[i].http3.ctx.accept_ctx = &listeners[i].accept_ctx;
             listeners[i].http3.ctx.send_retry = listener_config->quic.send_retry;
             listeners[i].http3.ctx.qpack = listener_config->quic.qpack;
-            if (conf.globalconf.http3.handshake_timeout_rtt_multiplier > 0)
-                listener_config->quic.ctx->handshake_timeout_rtt_multiplier =
-                    conf.globalconf.http3.handshake_timeout_rtt_multiplier;
-            if (conf.globalconf.http3.max_initial_handshake_packets > 0) {
-                listener_config->quic.ctx->max_initial_handshake_packets = conf.globalconf.http3.max_initial_handshake_packets;
-            }
             int fds[2];
             /* TODO switch to using named socket in temporary directory to forward packets between server generations */
             if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) != 0) {
@@ -3464,11 +3516,14 @@ static h2o_iovec_t on_extra_status(void *unused, h2o_globalconf_t *_conf, h2o_re
                        " \"generation\": %s,\n"
                        " \"connections\": %d,\n"
                        " \"max-connections\": %d,\n"
+                       " \"soft-connection-limit\": %d,\n"
+                       " \"soft-connection-limit.min-age\": %d,\n"
                        " \"listeners\": %zu,\n"
                        " \"worker-threads\": %zu,\n"
                        " \"num-sessions\": %lu",
                        OpenSSL_version(OPENSSL_VERSION), current_time, restart_time, (uint64_t)(now - conf.launch_time), generation,
-                       num_connections(0), conf.max_connections, conf.num_listeners, conf.thread_map.size, num_sessions(0));
+                       num_connections(0), conf.max_connections, conf.soft_connection_limit, conf.soft_connection_limit_min_age,
+                       conf.num_listeners, conf.thread_map.size, num_sessions(0));
     assert(ret.len < BUFSIZE);
 
 #if JEMALLOC_STATS == 1
@@ -3559,6 +3614,9 @@ static void setup_configurators(void)
                                         on_config_error_log);
         h2o_configurator_define_command(c, "max-connections", H2O_CONFIGURATOR_FLAG_GLOBAL, on_config_max_connections);
         h2o_configurator_define_command(c, "max-quic-connections", H2O_CONFIGURATOR_FLAG_GLOBAL, on_config_max_quic_connections);
+        h2o_configurator_define_command(c, "soft-connection-limit", H2O_CONFIGURATOR_FLAG_GLOBAL, on_config_soft_connection_limit);
+        h2o_configurator_define_command(c, "soft-connection-limit.min-age", H2O_CONFIGURATOR_FLAG_GLOBAL,
+                                        on_config_soft_connection_limit_min_age);
         h2o_configurator_define_command(c, "num-threads", H2O_CONFIGURATOR_FLAG_GLOBAL, on_config_num_threads);
         h2o_configurator_define_command(c, "num-quic-threads", H2O_CONFIGURATOR_FLAG_GLOBAL, on_config_num_quic_threads);
         h2o_configurator_define_command(c, "num-name-resolution-threads", H2O_CONFIGURATOR_FLAG_GLOBAL,
