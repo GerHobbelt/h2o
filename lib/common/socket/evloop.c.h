@@ -22,15 +22,11 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdlib.h>
-#include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #if H2O_USE_KTLS
 #include <linux/tls.h>
-#endif
-#ifdef __linux__
-#include <linux/errqueue.h>
 #endif
 #include "cloexec.h"
 #include "h2o/linklist.h"
@@ -218,14 +214,15 @@ static size_t write_core(struct st_h2o_evloop_socket_t *sock, h2o_iovec_t **bufs
             size_t encbufcnt = 1, enc_written;
             int sendmsg_flags = 0;
 #if H2O_USE_MSG_ZEROCOPY
-            /* Use zero copy if amount of data to be written is no less than 16KB, and if the memory can be returned to
-             * `h2o_socket_ssl_buffer_allocator`. Latter is a short-cut. It is only under exceptional conditions (e.g., TLS stack
-             * adding a post-handshake message) that we'd see the encrypted buffer grow to a size that cannot be returned to the
-             * recycling allocator. (Note: 16KB limit is fine only because we write to L1 cache. If we are to do non-temporal writes
-             * from AEAD, it might make sense to use zero copy regardless of `encbuf.len`, because copying from main memory is a
-             * cost. */
-            if (sock->super._zerocopy != NULL && encbuf.len >= 16384 &&
-                sock->super.ssl->output.buf.capacity == *h2o_socket_ssl_buffer_allocator.memsize)
+            /* Use zero copy if amount of data to be written is no less than 4KB, and if the memory can be returned to
+             * `zerocopy_buffer_allocator`. Latter is a short-cut. It is only under exceptional conditions (e.g., TLS stack adding
+             * a post-handshake message) that we'd see the buffer grow to a size that cannot be returned to the recycling allocator.
+             * Even though https://www.kernel.org/doc/html/v5.17/networking/msg_zerocopy.html recommends 10KB, 4KB has been chosen
+             * as the threshold, because we are likely to be using the non-temporal aesgcm engine and tx-nocache-copy, in which case
+             * copying sendmsg is going to be more costly than what the kernel documentation assumes. In a synthetic benchmark,
+             * changing from 16KB to 4KB increased the throughput by ~10%. */
+            if (sock->super.ssl->output.allocated_for_zerocopy && encbuf.len >= 4096 &&
+                sock->super.ssl->output.buf.capacity == zerocopy_buffer_allocator.conf->memsize)
                 sendmsg_flags = MSG_ZEROCOPY;
 #endif
             if ((enc_written = write_vecs(sock, &encbufs, &encbufcnt, sendmsg_flags)) == SIZE_MAX) {
@@ -275,7 +272,6 @@ static int sendvec_core(struct st_h2o_evloop_socket_t *sock)
         return 0;
 
     /* update offset, and return if we are not done yet */
-    sock->sendvec.len -= bytes_sent;
     if (sock->sendvec.len != 0)
         return 1;
 
@@ -354,7 +350,7 @@ void do_dispose_socket(h2o_socket_t *_sock)
     sock->_flags = H2O_SOCKET_FLAG_IS_DISPOSED | (sock->_flags & H2O_SOCKET_FLAG__EPOLL_IS_REGISTERED);
 
     /* Give backends chance to do the necessary cleanup, as well as giving them chance to switch to their own disposal method; e.g.,
-     * connect(AF_UNSPEC) with delays to reclaim all zero copy buffers. */
+     * shutdown(SHUT_RDWR) with delays to reclaim all zero copy buffers. */
     if (evloop_do_on_socket_close(sock))
         return;
 

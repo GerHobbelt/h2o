@@ -95,8 +95,15 @@ static int handle_zerocopy_notification(struct st_h2o_evloop_socket_t *sock)
                         if (c64 < sock->super._zerocopy->first_counter)
                             c64 += 0x100000000;
                         void *p = zerocopy_buffers_release(sock->super._zerocopy, c64);
-                        if (p != NULL && (sock->super.ssl == NULL || p != sock->super.ssl->output.buf.base))
-                            h2o_mem_free_recycle(&h2o_socket_ssl_buffer_allocator, p);
+                        if (p != NULL) {
+                            if (sock->super.ssl != NULL && p == sock->super.ssl->output.buf.base) {
+                                /* buffer being released from zerocopy still has some pending data to be written */
+                                assert(sock->super.ssl->output.zerocopy_owned);
+                                sock->super.ssl->output.zerocopy_owned = 0;
+                            } else {
+                                h2o_mem_free_recycle(&zerocopy_buffer_allocator, p);
+                            }
+                        }
                     }
                 }
             }
@@ -203,13 +210,20 @@ int evloop_do_proceed(h2o_evloop_t *_loop, int32_t max_wait)
     for (i = 0; i != nevents; ++i) {
         struct st_h2o_evloop_socket_t *sock = events[i].data.ptr;
         int notified = 0;
-        /* When receiving HUP (indicating reset) while the socket is polled neither for read or write, switch to edge trigger, as
-         * otherwise epoll_wait() would continue raising the HUP event. The application will eventually try to read or write to the
-         * socket and at that point detect that the socket has become unusable. */
+        /* When receiving HUP (indicating reset) while the socket is polled neither for read nor write, unregister the socket from
+         * epoll, otherwise epoll_wait() would continue raising the HUP event. This problem cannot be avoided by using edge trigger.
+         * The application will eventually try to read or write to the socket and at that point close the socket, detecting that it
+         * has become unusable. */
         if ((events[i].events & EPOLLHUP) != 0 &&
-            (sock->_flags & (H2O_SOCKET_FLAG_IS_POLLED_FOR_READ | H2O_SOCKET_FLAG_IS_POLLED_FOR_WRITE)) == 0) {
-            if (!change_epoll_mode(sock, EPOLLET))
-                h2o_fatal("do_proceed:epoll_ctl(MOD) failed for fd %d,errno=%d\n", sock->fd, errno);
+            (sock->_flags & (H2O_SOCKET_FLAG_IS_POLLED_FOR_READ | H2O_SOCKET_FLAG_IS_POLLED_FOR_WRITE)) == 0 &&
+            !(sock->super._zerocopy != NULL && (sock->_flags & H2O_SOCKET_FLAG_IS_DISPOSED) != 0)) {
+            assert((sock->_flags & H2O_SOCKET_FLAG__EPOLL_IS_REGISTERED) != 0);
+            int ret;
+            while ((ret = epoll_ctl(loop->ep, EPOLL_CTL_DEL, sock->fd, NULL)) != 0 && errno == EINTR)
+                ;
+            if (ret != 0)
+                h2o_error_printf("failed to unregister socket (fd:%d) that raised HUP; errno=%d\n", sock->fd, errno);
+            sock->_flags &= ~H2O_SOCKET_FLAG__EPOLL_IS_REGISTERED;
             notified = 1;
         }
         /* If the error event was a zerocopy notification, hide the error notification to application. Doing so is fine because
@@ -265,14 +279,13 @@ static int evloop_do_on_socket_close(struct st_h2o_evloop_socket_t *sock)
     if (sock->fd == -1)
         return 0;
 
-    /* If zero copy is in action, disconnect using AF_UNSPEC. Then, poll the socket until all zero copy buffers are reclaimed, at
+    /* If zero copy is in action, disconnect using shutdown(). Then, poll the socket until all zero copy buffers are reclaimed, at
      * which point we dispose of the socket. Edge trigger is used, as in level trigger EPOLLHUP will be notified continuously. */
     if (sock->super._zerocopy != NULL && !zerocopy_buffers_is_empty(sock->super._zerocopy)) {
-        struct sockaddr close_sa = {.sa_family = AF_UNSPEC};
-        while ((ret = connect(sock->fd, &close_sa, sizeof(close_sa))) == -1 && errno == EINTR)
+        while ((ret = shutdown(sock->fd, SHUT_RDWR)) == -1 && errno == EINTR)
             ;
         if (ret != 0 && errno != ENOTCONN)
-            h2o_error_printf("socket_close: connect(AF_UNSPEC) failed; errno=%d, fd=%d\n", errno, sock->fd);
+            h2o_error_printf("socket_close: shutdown(SHUT_RDWR) failed; errno=%d, fd=%d\n", errno, sock->fd);
         if (!change_epoll_mode(sock, EPOLLET))
             h2o_fatal("socket_close: epoll_ctl(MOD) failed; errno=%d, fd=%d\n", errno, sock->fd);
         /* drain error notifications after registering the edge trigger, otherwise there's chance of stall */

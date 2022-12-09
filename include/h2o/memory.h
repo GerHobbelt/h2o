@@ -92,11 +92,26 @@ typedef struct st_h2o_iovec_t {
     size_t len;
 } h2o_iovec_t;
 
+#define H2O_VECTOR(type)                                                                                                           \
+    struct {                                                                                                                       \
+        type *entries;                                                                                                             \
+        size_t size;                                                                                                               \
+        size_t capacity;                                                                                                           \
+    }
+
+typedef H2O_VECTOR(void) h2o_vector_t;
+typedef H2O_VECTOR(uint8_t) h2o_byte_vector_t;
+typedef H2O_VECTOR(h2o_iovec_t) h2o_iovec_vector_t;
+
+typedef struct st_h2o_mem_recycle_conf_t {
+    size_t memsize;
+    size_t alignment;
+} h2o_mem_recycle_conf_t;
+
 typedef struct st_h2o_mem_recycle_t {
-    const size_t *memsize;
-    size_t max;
-    size_t cnt;
-    void **chunks;
+    const h2o_mem_recycle_conf_t *conf;
+    H2O_VECTOR(void *) chunks;
+    size_t low_watermark;
 } h2o_mem_recycle_t;
 
 struct st_h2o_mem_pool_shared_entry_t {
@@ -164,17 +179,6 @@ typedef struct st_h2o_doublebuffer_t {
     size_t _bytes_inflight;
 } h2o_doublebuffer_t;
 
-#define H2O_VECTOR(type)                                                                                                           \
-    struct {                                                                                                                       \
-        type *entries;                                                                                                             \
-        size_t size;                                                                                                               \
-        size_t capacity;                                                                                                           \
-    }
-
-typedef H2O_VECTOR(void) h2o_vector_t;
-typedef H2O_VECTOR(uint8_t) h2o_byte_vector_t;
-typedef H2O_VECTOR(h2o_iovec_t) h2o_iovec_vector_t;
-
 extern void *(*volatile h2o_mem__set_secure)(void *, int, size_t);
 
 /**
@@ -200,6 +204,10 @@ static h2o_iovec_t h2o_iovec_init(const void *base, size_t len);
  * wrapper of malloc; allocates given size of memory or dies if impossible
  */
 H2O_RETURNS_NONNULL static void *h2o_mem_alloc(size_t sz);
+/**
+ * wrapper of posix_memalign; if alignment is zero, calls `malloc`
+ */
+H2O_RETURNS_NONNULL static void *h2o_mem_aligned_alloc(size_t alignment, size_t sz);
 /**
  * warpper of realloc; reallocs the given chunk or dies if impossible
  */
@@ -419,6 +427,17 @@ inline void *h2o_mem_alloc(size_t sz)
 {
     void *p = malloc(sz);
     if (p == NULL)
+        h2o_fatal("no memory");
+    return p;
+}
+
+inline void *h2o_mem_aligned_alloc(size_t alignment, size_t sz)
+{
+    if (alignment == 0)
+        return h2o_mem_alloc(sz);
+
+    void *p;
+    if (posix_memalign(&p, alignment, sz) != 0)
         h2o_fatal("no memory");
     return p;
 }

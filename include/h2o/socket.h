@@ -28,6 +28,9 @@ extern "C" {
 
 #include <stdint.h>
 #include <sys/socket.h>
+#ifdef __linux__
+#include <linux/errqueue.h>
+#endif
 #include <openssl/ssl.h>
 #include <openssl/opensslconf.h>
 #include "picotls.h"
@@ -43,6 +46,10 @@ extern "C" {
 #else
 #define H2O_USE_LIBUV 1
 #endif
+#endif
+
+#if defined(SO_ZEROCOPY) && defined(SO_EE_ORIGIN_ZEROCOPY)
+#define H2O_USE_MSG_ZEROCOPY 1
 #endif
 
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
@@ -237,7 +244,7 @@ extern h2o_buffer_prototype_t h2o_socket_buffer_prototype;
 /**
  * see H2O_SOCKET_DEFAULT_SSL_BUFFER_SIZE
  */
-extern size_t h2o_socket_ssl_buffer_size;
+extern h2o_mem_recycle_conf_t h2o_socket_ssl_buffer_conf;
 extern __thread h2o_mem_recycle_t h2o_socket_ssl_buffer_allocator;
 
 /**
@@ -361,10 +368,10 @@ ptls_t *h2o_socket_get_ptls(h2o_socket_t *sock);
  */
 int h2o_socket_can_tls_offload(h2o_socket_t *sock);
 /**
- * Switches the socket to zero copy mode, returning if successful. The socket can no longer be exported, once this function is
+ * Switches the socket to zerocopy mode, returning if successful. The socket can no longer be exported, once this function is
  * called.
  */
-int h2o_socket_use_zero_copy(h2o_socket_t *sock);
+int h2o_socket_use_zerocopy(h2o_socket_t *sock);
 /**
  *
  */
@@ -483,6 +490,11 @@ void h2o_sendvec_init_raw(h2o_sendvec_t *vec, const void *base, size_t len);
  *
  */
 int h2o_sendvec_read_raw(h2o_sendvec_t *vec, void *dst, size_t len);
+
+/**
+ * GC resources
+ */
+void h2o_socket_clear_recycle(int full);
 
 /**
  * This is a thin wrapper around sendfile (2) that hides the differences between various OS implementations.
