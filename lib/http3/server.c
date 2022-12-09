@@ -654,7 +654,7 @@ Redo:
         ",cwnd-minimum=%" PRIu32 ",cwnd-maximum=%" PRIu32 ",num-loss-episodes=%" PRIu32 ",num-ptos=%" PRIu64
         ",delivery-rate-latest=%" PRIu64 ",delivery-rate-smoothed=%" PRIu64
         ",delivery-rate-stdev=%" PRIu64 APPLY_NUM_FRAMES(FORMAT_OF_NUM_FRAMES, received)
-            APPLY_NUM_FRAMES(FORMAT_OF_NUM_FRAMES, sent) ",num-sentmap-packets-max=%zu",
+            APPLY_NUM_FRAMES(FORMAT_OF_NUM_FRAMES, sent) ",num-sentmap-packets-largest=%zu",
         stats.num_packets.received, stats.num_packets.decryption_failed, stats.num_packets.sent, stats.num_packets.lost,
         stats.num_packets.lost_time_threshold, stats.num_packets.ack_received, stats.num_packets.late_acked,
         stats.num_bytes.received, stats.num_bytes.sent, stats.num_bytes.lost, stats.num_bytes.ack_received,
@@ -1922,7 +1922,7 @@ h2o_http3_conn_t *h2o_http3_server_accept(h2o_http3_server_ctx_t *ctx, quicly_ad
     if (accept_ret != 0) {
         h2o_http3_conn_t *ret = NULL;
         if (accept_ret == QUICLY_ERROR_DECRYPTION_FAILED)
-            ret = (h2o_http3_conn_t *)H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED;
+            ret = (h2o_http3_conn_t *)&h2o_quic_accept_conn_decryption_failed;
         h2o_http3_dispose_conn(&conn->h3);
         kh_destroy(stream, conn->datagram_flows);
         h2o_destroy_connection(&conn->super);
@@ -1938,7 +1938,7 @@ h2o_http3_conn_t *h2o_http3_server_accept(h2o_http3_server_ctx_t *ctx, quicly_ad
 
     if (!h2o_quic_send(&conn->h3.super)) {
         /* When `h2o_quic_send` fails, it destroys the connection object. */
-        return H2O_QUIC_ACCEPT_CONN_CLOSED;
+        return &h2o_http3_accept_conn_closed;
     }
 
     return &conn->h3;
