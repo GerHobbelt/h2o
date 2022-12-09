@@ -275,6 +275,7 @@ static int sendvec_core(struct st_h2o_evloop_socket_t *sock)
         return 0;
 
     /* update offset, and return if we are not done yet */
+    sock->sendvec.len -= bytes_sent;
     if (sock->sendvec.len != 0)
         return 1;
 
@@ -416,7 +417,7 @@ Schedule_Write:
 static int can_tls_offload(h2o_socket_t *sock)
 {
 #if H2O_USE_KTLS
-    if (sock->ssl->ptls != NULL) {
+    if (sock->ssl->offload != H2O_SOCKET_SSL_OFFLOAD_NONE && sock->ssl->ptls != NULL) {
         ptls_cipher_suite_t *cipher = ptls_get_cipher(sock->ssl->ptls);
         switch (cipher->id) {
         case PTLS_CIPHER_SUITE_AES_128_GCM_SHA256:
