@@ -26,6 +26,9 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#if H2O_USE_KTLS
+#include <linux/tls.h>
+#endif
 #include "cloexec.h"
 #include "h2o/linklist.h"
 
@@ -54,10 +57,7 @@ struct st_h2o_evloop_socket_t {
     /**
      * vector to be sent (or vec.callbacks is NULL when not used)
      */
-    struct {
-        h2o_sendvec_t vec;
-        size_t off;
-    } sendvec;
+    h2o_sendvec_t sendvec;
 };
 
 static void link_to_pending(struct st_h2o_evloop_socket_t *sock);
@@ -94,6 +94,8 @@ static void evloop_do_on_socket_export(struct st_h2o_evloop_socket_t *sock);
 #else
 #error "poller not specified"
 #endif
+
+size_t h2o_evloop_socket_max_read_size = 1024 * 1024; /* by default, we read up to 1MB at once */
 
 void link_to_pending(struct st_h2o_evloop_socket_t *sock)
 {
@@ -187,8 +189,11 @@ static size_t write_vecs(struct st_h2o_evloop_socket_t *sock, h2o_iovec_t **bufs
 
 static size_t write_core(struct st_h2o_evloop_socket_t *sock, h2o_iovec_t **bufs, size_t *bufcnt)
 {
-    if (sock->super.ssl == NULL)
+    if (sock->super.ssl == NULL || sock->super.ssl->offload == H2O_SOCKET_SSL_OFFLOAD_ON) {
+        if (sock->super.ssl != NULL)
+            assert(!has_pending_ssl_bytes(sock->super.ssl));
         return write_vecs(sock, bufs, bufcnt);
+    }
 
     /* SSL */
     size_t first_buf_written = 0;
@@ -217,8 +222,8 @@ static size_t write_core(struct st_h2o_evloop_socket_t *sock, h2o_iovec_t **bufs
         /* convert more cleartext to TLS records if possible, or bail out on fatal error */
         if ((first_buf_written = generate_tls_records(&sock->super, bufs, bufcnt, first_buf_written)) == SIZE_MAX)
             break;
-        /* as anoptimization, if we have a flattened vector, release memory as soon as they have been encrypted */
-        if (sock->super._write_buf.flattened != NULL) {
+        /* as an optimization, if we have a flattened vector, release memory as soon as they have been encrypted */
+        if (*bufcnt == 0 && sock->super._write_buf.flattened != NULL) {
             h2o_mem_free_recycle(&h2o_socket_ssl_buffer_allocator, sock->super._write_buf.flattened);
             sock->super._write_buf.flattened = NULL;
         }
@@ -235,20 +240,18 @@ static int sendvec_core(struct st_h2o_evloop_socket_t *sock)
 {
     size_t bytes_sent;
 
-    assert(sock->sendvec.off < sock->sendvec.vec.len);
+    assert(sock->sendvec.len != 0);
 
     /* send, and return an error if failed */
-    if ((bytes_sent = sock->sendvec.vec.callbacks->send_(&sock->sendvec.vec, sock->fd,
-                                                         sock->sendvec.vec.len - sock->sendvec.off)) == SIZE_MAX)
+    if ((bytes_sent = sock->sendvec.callbacks->send_(&sock->sendvec, sock->fd, sock->sendvec.len)) == SIZE_MAX)
         return 0;
 
     /* update offset, and return if we are not done yet */
-    if ((sock->sendvec.off += bytes_sent) < sock->sendvec.vec.len)
+    if (sock->sendvec.len != 0)
         return 1;
 
     /* operation complete; mark as such */
-    assert(sock->sendvec.off == sock->sendvec.vec.len);
-    sock->sendvec.vec.callbacks = NULL;
+    sock->sendvec.callbacks = NULL;
     return 1;
 }
 
@@ -276,9 +279,9 @@ void write_pending(struct st_h2o_evloop_socket_t *sock)
     dispose_write_buf(&sock->super);
 
     /* send the vector, if we have one and if all buffered writes are complete */
-    if (sock->sendvec.vec.callbacks != NULL && sock->super._write_buf.cnt == 0 && !has_pending_ssl_bytes(sock->super.ssl)) {
+    if (sock->sendvec.callbacks != NULL && sock->super._write_buf.cnt == 0 && !has_pending_ssl_bytes(sock->super.ssl)) {
         /* send, and upon partial send, return without changing state for another round */
-        if (sendvec_core(sock) && sock->sendvec.vec.callbacks != NULL)
+        if (sendvec_core(sock) && sock->sendvec.callbacks != NULL)
             return;
     }
 
@@ -355,12 +358,12 @@ void do_write(h2o_socket_t *_sock, h2o_iovec_t *bufs, size_t bufcnt)
             h2o_mem_free_recycle(&h2o_socket_ssl_buffer_allocator, sock->super._write_buf.flattened);
             sock->super._write_buf.flattened = NULL;
         }
-        if (sock->sendvec.vec.callbacks != NULL) {
+        if (sock->sendvec.callbacks != NULL) {
             if (!sendvec_core(sock)) {
                 report_early_write_error(&sock->super);
                 return;
             }
-            if (sock->sendvec.vec.callbacks != NULL)
+            if (sock->sendvec.callbacks != NULL)
                 goto Schedule_Write;
         }
         sock->_flags |= H2O_SOCKET_FLAG_IS_WRITE_NOTIFY;
@@ -375,16 +378,129 @@ Schedule_Write:
     link_to_statechanged(sock);
 }
 
-static void do_write_with_sendvec(h2o_socket_t *_sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_sendvec_t *sendvec)
+static int can_tls_offload(h2o_socket_t *sock)
+{
+#if H2O_USE_KTLS
+    if (sock->ssl->ptls != NULL) {
+        ptls_cipher_suite_t *cipher = ptls_get_cipher(sock->ssl->ptls);
+        switch (cipher->id) {
+        case PTLS_CIPHER_SUITE_AES_128_GCM_SHA256:
+        case PTLS_CIPHER_SUITE_AES_256_GCM_SHA384:
+            return 1;
+        default:
+            break;
+        }
+    }
+#endif
+
+    return 0;
+}
+
+#if H2O_USE_KTLS
+static void switch_to_ktls(struct st_h2o_evloop_socket_t *sock)
+{
+    assert(sock->super.ssl->offload == H2O_SOCKET_SSL_OFFLOAD_TBD);
+
+    /* Postpone the decision, when we are still in the early stages of the connection, as we want to use userspace TLS for
+     * generating small TLS records. TODO: integrate with TLS record size calculation logic. */
+    if (sock->super.bytes_written < 65536)
+        return;
+
+    /* load the key to the kernel */
+    struct {
+        uint8_t key[PTLS_MAX_SECRET_SIZE];
+        uint8_t iv[PTLS_MAX_DIGEST_SIZE];
+        uint64_t seq;
+        union {
+            struct tls12_crypto_info_aes_gcm_128 aesgcm128;
+            struct tls12_crypto_info_aes_gcm_256 aesgcm256;
+        } tx_params;
+        size_t tx_params_size;
+    } keys;
+
+    /* at the moment, only TLS/1.3 connections using aes-gcm is supported */
+    if (sock->super.ssl->ptls == NULL)
+        goto Fail;
+    ptls_cipher_suite_t *cipher = ptls_get_cipher(sock->super.ssl->ptls);
+    switch (cipher->id) {
+    case PTLS_CIPHER_SUITE_AES_128_GCM_SHA256:
+    case PTLS_CIPHER_SUITE_AES_256_GCM_SHA384:
+        break;
+    default:
+        goto Fail;
+    }
+    if (ptls_get_traffic_keys(sock->super.ssl->ptls, 1, keys.key, keys.iv, &keys.seq) != 0)
+        goto Fail;
+    keys.seq = htobe64(keys.seq); /* converted to big endian ASAP */
+
+#define SETUP_TX_PARAMS(target, type)                                                                                              \
+    do {                                                                                                                           \
+        keys.tx_params.target.info.version = TLS_1_3_VERSION;                                                                      \
+        keys.tx_params.target.info.cipher_type = type;                                                                             \
+        H2O_BUILD_ASSERT(sizeof(keys.tx_params.target.key) == cipher->aead->key_size);                                             \
+        memcpy(keys.tx_params.target.key, keys.key, cipher->aead->key_size);                                                       \
+        H2O_BUILD_ASSERT(cipher->aead->iv_size == 12);                                                                             \
+        H2O_BUILD_ASSERT(sizeof(keys.tx_params.target.salt) == 4);                                                                 \
+        memcpy(keys.tx_params.target.salt, keys.iv, 4);                                                                            \
+        H2O_BUILD_ASSERT(sizeof(keys.tx_params.target.iv) == 8);                                                                   \
+        memcpy(keys.tx_params.target.iv, keys.iv + 4, 8);                                                                          \
+        H2O_BUILD_ASSERT(sizeof(keys.tx_params.target.rec_seq) == sizeof(keys.seq));                                               \
+        memcpy(keys.tx_params.target.rec_seq, &keys.seq, sizeof(keys.seq));                                                        \
+        keys.tx_params_size = sizeof(keys.tx_params.target);                                                                       \
+    } while (0)
+    switch (cipher->id) {
+    case PTLS_CIPHER_SUITE_AES_128_GCM_SHA256:
+        SETUP_TX_PARAMS(aesgcm128, TLS_CIPHER_AES_GCM_128);
+        break;
+    case PTLS_CIPHER_SUITE_AES_256_GCM_SHA384:
+        SETUP_TX_PARAMS(aesgcm256, TLS_CIPHER_AES_GCM_256);
+        break;
+    default:
+        goto Fail;
+    }
+#undef SETUP_TX_PARAMS
+
+    /* set to kernel */
+    if (setsockopt(sock->fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) != 0)
+        goto Fail;
+    if (setsockopt(sock->fd, SOL_TLS, TLS_TX, &keys.tx_params, keys.tx_params_size) != 0)
+        goto Fail;
+    sock->super.ssl->offload = H2O_SOCKET_SSL_OFFLOAD_ON;
+
+Exit:
+    ptls_clear_memory(&keys, sizeof(keys));
+    return;
+
+Fail:
+    sock->super.ssl->offload = H2O_SOCKET_SSL_OFFLOAD_NONE;
+    goto Exit;
+}
+#endif
+
+static int do_write_with_sendvec(h2o_socket_t *_sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_sendvec_t *sendvec)
 {
     struct st_h2o_evloop_socket_t *sock = (struct st_h2o_evloop_socket_t *)_sock;
 
     assert(sendvec->callbacks->send_ != NULL);
-    assert(sock->sendvec.vec.callbacks == NULL);
+    assert(sock->sendvec.callbacks == NULL);
 
-    sock->sendvec.vec = *sendvec;
-    sock->sendvec.off = 0;
+    /* If userspace TLS is currently in use, either switch to kTLS or refuse. */
+    if (sock->super.ssl != NULL) {
+#if H2O_USE_KTLS
+        if (sock->super.ssl->offload == H2O_SOCKET_SSL_OFFLOAD_TBD)
+            switch_to_ktls(sock);
+        if (sock->super.ssl->offload != H2O_SOCKET_SSL_OFFLOAD_ON)
+            return 0;
+#else
+        return 0;
+#endif
+    }
+
+    /* handling writes with sendvec, here */
+    sock->sendvec = *sendvec;
     do_write(&sock->super, bufs, bufcnt);
+
+    return 1;
 }
 
 int h2o_socket_get_fd(h2o_socket_t *_sock)
@@ -472,7 +588,7 @@ static struct st_h2o_evloop_socket_t *create_socket(h2o_evloop_t *loop, int fd, 
     sock->loop = loop;
     sock->fd = fd;
     sock->_flags = flags;
-    sock->max_read_size = 1024 * 1024; /* by default, we read up to 1MB at once */
+    sock->max_read_size = h2o_evloop_socket_max_read_size; /* by default, we read up to 1MB at once */
     sock->_next_pending = sock;
     sock->_next_statechanged = sock;
 
@@ -649,13 +765,13 @@ static void run_socket(struct st_h2o_evloop_socket_t *sock)
         const char *err = NULL;
         assert(sock->super._cb.write != NULL);
         sock->_flags &= ~H2O_SOCKET_FLAG_IS_WRITE_NOTIFY;
-        if (sock->super._write_buf.cnt != 0 || has_pending_ssl_bytes(sock->super.ssl) || sock->sendvec.vec.callbacks != NULL) {
+        if (sock->super._write_buf.cnt != 0 || has_pending_ssl_bytes(sock->super.ssl) || sock->sendvec.callbacks != NULL) {
             /* error */
             err = h2o_socket_error_io;
             sock->super._write_buf.cnt = 0;
             if (has_pending_ssl_bytes(sock->super.ssl))
                 dispose_ssl_output_buffer(sock->super.ssl);
-            sock->sendvec.vec.callbacks = NULL;
+            sock->sendvec.callbacks = NULL;
         } else if ((sock->_flags & H2O_SOCKET_FLAG_IS_CONNECTING) != 0) {
             /* completion of connect; determine error if we do not know whether the connection has been successfully estabilshed */
             if ((sock->_flags & H2O_SOCKET_FLAG_IS_CONNECTING_CONNECTED) == 0) {

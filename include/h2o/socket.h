@@ -116,23 +116,22 @@ enum {
 
 typedef struct st_h2o_sendvec_t h2o_sendvec_t;
 
+/**
+ * Callbacks of `h2o_sendvec_t`. Random access capability has been removed. `read_` and `send_` only provide one-pass sequential
+ * access. Properties of `h2o_sendvec_t` (e.g., `len`, `raw`) are adjusted as bytes are read / sent from the vector.
+ */
 typedef struct st_h2o_sendvec_callbacks_t {
     /**
-     * optional callback used to serialize the bytes held by the vector. Returns if the operation succeeded. When false is returned,
-     * the generator is considered as been error-closed by itself.  If the callback is NULL, the data is pre-flattened and available
-     * in `h2o_sendvec_t::raw`.
+     * Mandatory callback used to load the bytes held by the vector. Returns if the operation succeeded. When false is returned, the
+     * generator is considered as been error-closed by itself.  If the callback is `h2o_sendvec_read_raw`, the data is available as
+     * raw bytes in `h2o_sendvec_t::raw`.
      */
-    int (*flatten)(h2o_sendvec_t *vec, h2o_iovec_t dst, size_t off);
+    int (*read_)(h2o_sendvec_t *vec, void *dst, size_t len);
     /**
-     * Optional callback for sending contents of a vector directly to a socket. This API provides one-pass, sequential access only.
-     * Returns number of bytes being sent (could be zero), or, upon error, SIZE_MAX.
+     * Optional callback for sending contents of a vector directly to a socket. Returns number of bytes being sent (could be zero),
+     * or, upon error, SIZE_MAX.
      */
     size_t (*send_)(h2o_sendvec_t *vec, int sockfd, size_t len);
-    /**
-     * optional callback that can be used to retain the buffer after flattening all data. This allows H3 to re-flatten data upon
-     * retransmission. Increments the reference counter if `is_incr` is set to true, otherwise the counter is decremented.
-     */
-    void (*update_refcnt)(h2o_sendvec_t *vec, int is_incr);
 } h2o_sendvec_callbacks_t;
 
 /**
@@ -239,6 +238,11 @@ extern h2o_buffer_prototype_t h2o_socket_buffer_prototype;
  */
 extern size_t h2o_socket_ssl_buffer_size;
 extern __thread h2o_mem_recycle_t h2o_socket_ssl_buffer_allocator;
+
+/**
+ * boolean flag indicating if kTLS should be used (when preferable)
+ */
+extern int h2o_socket_use_ktls;
 
 extern const char h2o_socket_error_out_of_memory[];
 extern const char h2o_socket_error_io[];
@@ -354,6 +358,10 @@ ptls_t *h2o_socket_get_ptls(h2o_socket_t *sock);
 /**
  *
  */
+int h2o_socket_can_tls_offload(h2o_socket_t *sock);
+/**
+ *
+ */
 h2o_iovec_t h2o_socket_log_tcp_congestion_controller(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 h2o_iovec_t h2o_socket_log_tcp_delivery_rate(h2o_socket_t *sock, h2o_mem_pool_t *pool);
 const char *h2o_socket_get_ssl_protocol_version(h2o_socket_t *sock);
@@ -466,14 +474,9 @@ void h2o_socket_set_skip_tracing(h2o_socket_t *sock, int skip_tracing);
  */
 void h2o_sendvec_init_raw(h2o_sendvec_t *vec, const void *base, size_t len);
 /**
- * Initializes a send vector that refers to immutable memory region. It is the responsible of the generator to preserve the contents
- * of the specified memory region until the user of the send vector finishes using the send vector.
- */
-void h2o_sendvec_init_immutable(h2o_sendvec_t *vec, const void *base, size_t len);
-/**
  *
  */
-int h2o_sendvec_flatten_raw(h2o_sendvec_t *vec, h2o_iovec_t dst, size_t off);
+int h2o_sendvec_read_raw(h2o_sendvec_t *vec, void *dst, size_t len);
 
 /**
  * This is a thin wrapper around sendfile (2) that hides the differences between various OS implementations.

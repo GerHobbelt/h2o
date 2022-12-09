@@ -351,10 +351,22 @@ static void do_send(struct rp_generator_t *self)
     h2o_send(self->src_req, vecs, veccnt, ststate);
 }
 
-static int from_pipe_flatten(h2o_sendvec_t *vec, h2o_iovec_t dst, size_t off)
+static int from_pipe_read(h2o_sendvec_t *vec, void *dst, size_t len)
 {
-    h2o_fatal("FIXME");
-    return 0;
+    struct rp_generator_t *self = (void *)vec->cb_arg[0];
+
+    while (len != 0) {
+        ssize_t ret;
+        while ((ret = read(self->pipe_reader.fds[0], dst, len)) == -1 && errno == EINTR)
+            ;
+        if (ret <= 0)
+            return 0;
+        dst += ret;
+        len -= ret;
+        vec->len -= ret;
+    }
+
+    return 1;
 }
 
 static size_t from_pipe_send(h2o_sendvec_t *vec, int sockfd, size_t len)
@@ -369,6 +381,9 @@ static size_t from_pipe_send(h2o_sendvec_t *vec, int sockfd, size_t len)
         return 0;
     if (bytes_sent <= 0)
         return SIZE_MAX;
+
+    vec->len -= bytes_sent;
+
     return bytes_sent;
 #else
     h2o_fatal("%s:not implemented", __FUNCTION__);
@@ -387,11 +402,7 @@ static void do_send_from_pipe(struct rp_generator_t *self)
         return;
     }
 
-    static const h2o_sendvec_callbacks_t callbacks = {
-        .flatten = from_pipe_flatten,
-        .send_ = from_pipe_send,
-        .update_refcnt = NULL, /* FIXME - maybe we don't need refcounting of a pipe vector that does not support random access */
-    };
+    static const h2o_sendvec_callbacks_t callbacks = {.read_ = from_pipe_read, .send_ = from_pipe_send};
     h2o_sendvec_t vec = {.callbacks = &callbacks};
     if ((vec.len = self->body_bytes_read - self->body_bytes_sent) > H2O_PULL_SENDVEC_MAX_SIZE)
         vec.len = H2O_PULL_SENDVEC_MAX_SIZE;
@@ -760,6 +771,21 @@ static h2o_httpclient_head_cb on_connect(h2o_httpclient_t *client, const char *e
     self->client->informational_cb = on_1xx;
 
     client->get_conn_properties(client, &req->proxy_stats.conn);
+
+    { /* indicate to httpclient if use of pipe is preferred */
+        h2o_conn_t *conn = self->src_req->conn;
+        switch (conn->ctx->globalconf->proxy.zero_copy) {
+        case H2O_PROXY_ZERO_COPY_ALWAYS:
+            props->prefer_pipe_reader = 1;
+            break;
+        case H2O_PROXY_ZERO_COPY_ENABLED:
+            if (conn->callbacks->can_zero_copy != NULL && conn->callbacks->can_zero_copy(conn))
+                props->prefer_pipe_reader = 1;
+            break;
+        default:
+            break;
+        }
+    }
 
     return on_head;
 }

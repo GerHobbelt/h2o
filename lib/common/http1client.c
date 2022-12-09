@@ -30,6 +30,12 @@
 #include "h2o/httpclient.h"
 #include "h2o/token.h"
 
+#if !H2O_USE_LIBUV && defined(__linux__)
+#define USE_PIPE_READER 1
+#else
+#define USE_PIPE_READER 0
+#endif
+
 enum enum_h2o_http1client_stream_state {
     STREAM_STATE_HEAD,
     STREAM_STATE_BODY,
@@ -79,9 +85,11 @@ struct st_h2o_http1client_t {
     unsigned _is_chunked : 1;
     unsigned _seen_at_least_one_chunk : 1;
     unsigned _delay_free : 1;
+    unsigned _app_prefers_pipe_reader : 1;
 };
 
 static void on_body_to_pipe(h2o_socket_t *_sock, const char *err);
+
 static void req_body_send(struct st_h2o_http1client_t *client);
 static void do_update_window(h2o_httpclient_t *_client);
 
@@ -233,19 +241,22 @@ static void on_body_content_length(h2o_socket_t *sock, const char *err)
             close_client(client);
             return;
         }
-        if (client->pipe_reader.on_body_piped != NULL) {
-            h2o_socket_dont_read(client->sock, 1);
-            client->reader = on_body_to_pipe;
-        }
-        do_update_window(&client->super);
     }
+
+#if USE_PIPE_READER
+    if (client->pipe_reader.on_body_piped != NULL) {
+        h2o_socket_dont_read(client->sock, 1);
+        client->reader = on_body_to_pipe;
+    }
+#endif
+    do_update_window(&client->super);
 
     h2o_timer_link(client->super.ctx->loop, client->super.ctx->io_timeout, &client->super._timeout);
 }
 
 void on_body_to_pipe(h2o_socket_t *_sock, const char *err)
 {
-#ifdef __linux__
+#if USE_PIPE_READER
     struct st_h2o_http1client_t *client = _sock->data;
 
     h2o_timer_unlink(&client->super._timeout);
@@ -393,6 +404,12 @@ static void on_head(h2o_socket_t *sock, const char *err)
         return;
     }
 
+    /* revert max read size to 1MB now that we have received the first chunk, presumably carrying all the response headers */
+#if USE_PIPE_READER
+    if (client->_app_prefers_pipe_reader)
+        h2o_evloop_socket_set_max_read_size(client->sock, h2o_evloop_socket_max_read_size);
+#endif
+
     client->super._timeout.cb = on_head_timeout;
 
     headers = h2o_mem_alloc_pool(client->super.pool, *headers, MAX_HEADERS);
@@ -512,10 +529,12 @@ static void on_head(h2o_socket_t *sock, const char *err)
         .num_headers = num_headers,
         .header_requires_dup = 1,
     };
-#if !H2O_USE_LIBUV && defined(__linux__)
+#if USE_PIPE_READER
     /* If there is no less than 64KB of data to be read from the socket, offer the application the opportunity to use pipe for
-     * transferring the content zero-copy (TODO fine tune the threshold). */
-    if (reader == on_body_content_length && client->sock->input->size + 65536 <= client->_body_decoder.content_length.bytesleft)
+     * transferring the content zero-copy. As switching to pipe involves the cost of creating a pipe (and disposing it when the
+     * request is complete), we adopt this margin of 64KB, which offers clear improvement (5%) on 9th-gen Intel Core. */
+    if (client->_app_prefers_pipe_reader && reader == on_body_content_length &&
+        client->sock->input->size + 65536 <= client->_body_decoder.content_length.bytesleft)
         on_head.pipe_reader = &client->pipe_reader;
 #endif
 
@@ -802,6 +821,15 @@ static void start_request(struct st_h2o_http1client_t *client, h2o_iovec_t metho
     client->state.req = STREAM_STATE_BODY;
     client->super.timings.request_begin_at = h2o_gettimeofday(client->super.ctx->loop);
 
+    /* If there's possibility of using a pipe for forwarding the content, reduce maximum read size before fetching headers. The
+     * intent here is to not do a full-sized read of 1MB. 16KB has been chosen so that all HTTP response headers would be available,
+     * and that an almost full-sized HTTP/2 frame / TLS record can be generated for the first chunk of data that we pass through
+     * memory. */
+#if USE_PIPE_READER
+    if (client->_app_prefers_pipe_reader && h2o_evloop_socket_max_read_size > 16384)
+        h2o_evloop_socket_set_max_read_size(client->sock, 16384);
+#endif
+
     h2o_socket_read_start(client->sock, on_head);
 }
 
@@ -823,6 +851,7 @@ static void on_connection_ready(struct st_h2o_http1client_t *client)
 
     client->super._cb.on_head = client->super._cb.on_connect(&client->super, NULL, &method, &url, (const h2o_header_t **)&headers,
                                                              &num_headers, &body, &client->proceed_req, &props, client->_origin);
+    client->_app_prefers_pipe_reader = props.prefer_pipe_reader;
 
     if (client->super._cb.on_head == NULL) {
         close_client(client);
